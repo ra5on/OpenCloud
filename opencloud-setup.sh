@@ -42,32 +42,118 @@ ARCH=$(uname -m)
 SERVER_IP=$(hostname -I | awk '{print $1}')
 OC_URL="https://${SERVER_IP}:${OC_PORT}"
 
+# ─── OS-Erkennung ─────────────────────────────────────────────
+DISTRO_ID=$(. /etc/os-release && echo "$ID")
+DISTRO_VERSION=$(. /etc/os-release && echo "$VERSION_CODENAME")
+info "Erkanntes System: ${DISTRO_ID} ${DISTRO_VERSION}"
+
 info "Starte OpenCloud Installation auf ${SERVER_IP}..."
+
+# ─── Alte Docker-Quellen bereinigen (VOR erstem apt-get update!) ──────────────
+# Verhindert Fehler falls ein vorheriger Installations-Versuch eine ungültige
+# docker.list hinterlassen hat (z.B. mit nicht-unterstütztem Debian-Codename wie "forky")
+if [[ -f /etc/apt/sources.list.d/docker.list ]]; then
+    warn "Alte Docker-Quelldatei gefunden – wird entfernt um apt-Fehler zu vermeiden."
+    rm -f /etc/apt/sources.list.d/docker.list
+fi
+rm -f /etc/apt/keyrings/docker.gpg 2>/dev/null || true
 
 # ─── System-Abhängigkeiten ────────────────────────────────────
 info "Installiere Abhängigkeiten..."
 apt-get update -qq
 apt-get install -y \
     curl wget ca-certificates gnupg lsb-release \
-    apt-transport-https software-properties-common \
+    apt-transport-https \
     openssl jq net-tools unzip
+
+# software-properties-common ist nur auf Ubuntu verfügbar
+# Auf Debian wird es nicht benötigt, da Docker direkt über apt installiert wird
+if [[ "$DISTRO_ID" == "ubuntu" ]]; then
+    apt-get install -y software-properties-common
+fi
 
 # ─── Docker ───────────────────────────────────────────────────
 if ! command -v docker &>/dev/null; then
-    info "Installiere Docker..."
-    DISTRO_ID=$(. /etc/os-release && echo "$ID")
-    apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
-    curl -fsSL "https://download.docker.com/linux/${DISTRO_ID}/gpg" \
-        | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-    echo "deb [arch=arm64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] \
-https://download.docker.com/linux/${DISTRO_ID} $(lsb_release -cs) stable" \
-        > /etc/apt/sources.list.d/docker.list
-    apt-get update -qq
-    apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    info "Installiere Docker für ${DISTRO_ID} ${DISTRO_VERSION}..."
+
+    # Alte Docker-Pakete entfernen (nur wenn tatsächlich installiert)
+    for pkg in docker docker-engine docker.io containerd runc docker-compose; do
+        dpkg -l "$pkg" 2>/dev/null | grep -q "^ii" && apt-get remove -y "$pkg" 2>/dev/null || true
+    done
+
+    # Altes/fehlerhaftes docker.list immer entfernen damit kein alter Eintrag stört
+    rm -f /etc/apt/sources.list.d/docker.list
+    rm -f /etc/apt/keyrings/docker.gpg
+
+    install -m 0755 -d /etc/apt/keyrings
+
+    DOCKER_INSTALLED=false
+
+    # ── Methode 1: Offizielles Docker-Repo (download.docker.com) ──────────────
+    # Unterstützte Debian-Versionen prüfen; Forky/Testing → bookworm als Fallback
+    if [[ "$DISTRO_ID" == "debian" ]]; then
+        SUPPORTED_DEBIAN_CODENAMES="buster bullseye bookworm"
+        if echo "$SUPPORTED_DEBIAN_CODENAMES" | grep -qw "$DISTRO_VERSION"; then
+            DOCKER_CODENAME="$DISTRO_VERSION"
+        else
+            warn "Debian '${DISTRO_VERSION}' nicht im Docker-Repo → verwende 'bookworm' als Fallback."
+            DOCKER_CODENAME="bookworm"
+        fi
+    else
+        DOCKER_CODENAME="$DISTRO_VERSION"
+    fi
+
+    info "Versuche Docker über download.docker.com (${DISTRO_ID}/${DOCKER_CODENAME})..."
+    if curl -fsSL "https://download.docker.com/linux/${DISTRO_ID}/gpg" \
+            | gpg --dearmor -o /etc/apt/keyrings/docker.gpg 2>/dev/null; then
+        chmod a+r /etc/apt/keyrings/docker.gpg
+        echo "deb [arch=arm64 signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/${DISTRO_ID} ${DOCKER_CODENAME} stable" \
+            > /etc/apt/sources.list.d/docker.list
+        if apt-get update -qq 2>/dev/null && \
+           apt-get install -y docker-ce docker-ce-cli containerd.io \
+               docker-buildx-plugin docker-compose-plugin 2>/dev/null; then
+            DOCKER_INSTALLED=true
+            info "Docker über download.docker.com installiert."
+        else
+            warn "Installation über download.docker.com fehlgeschlagen."
+            rm -f /etc/apt/sources.list.d/docker.list /etc/apt/keyrings/docker.gpg
+        fi
+    else
+        warn "GPG-Key von download.docker.com konnte nicht geladen werden."
+        rm -f /etc/apt/keyrings/docker.gpg
+    fi
+
+    # ── Methode 2: Debian-native Pakete (docker.io aus debian.org) ────────────
+    if [[ "$DOCKER_INSTALLED" == false ]]; then
+        warn "Fallback: Installiere docker.io aus den Debian-Paketquellen..."
+        apt-get update -qq
+        if apt-get install -y docker.io docker-compose; then
+            DOCKER_INSTALLED=true
+            info "Docker über debian.org (docker.io) installiert."
+        else
+            error "Docker-Installation fehlgeschlagen! Bitte Logs prüfen."
+        fi
+    fi
+
     systemctl enable --now docker
     info "Docker: $(docker --version)"
 else
-    info "Docker bereits vorhanden."
+    info "Docker bereits vorhanden: $(docker --version)"
+fi
+
+# docker compose Befehl sicherstellen (docker.io liefert nur docker-compose als separates Binary)
+if ! docker compose version &>/dev/null 2>&1; then
+    if command -v docker-compose &>/dev/null; then
+        # Shim erstellen damit "docker compose" funktioniert
+        mkdir -p /usr/local/lib/docker/cli-plugins
+        ln -sf "$(command -v docker-compose)" /usr/local/lib/docker/cli-plugins/docker-compose
+        info "docker-compose als docker compose Plugin verlinkt."
+    else
+        apt-get install -y docker-compose-plugin 2>/dev/null \
+            || apt-get install -y docker-compose 2>/dev/null \
+            || error "docker compose konnte nicht installiert werden!"
+    fi
 fi
 
 # ─── Verzeichnisse ────────────────────────────────────────────
